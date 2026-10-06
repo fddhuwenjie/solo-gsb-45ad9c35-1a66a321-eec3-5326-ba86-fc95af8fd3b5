@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ from .models import DecodeResponse, ProtocolDefinition
 
 # Every column of the sessions table, in declaration order. Used by the
 # in-place rebuild that converts pre-existing databases to the wide audit
-# column format (see _migrate_sessions).
+# column format (see _migrate_sessions_locked).
 _SESSION_COLUMNS = (
     "session_id",
     "protocol_id",
@@ -67,7 +68,12 @@ CREATE TABLE IF NOT EXISTS {table} (
 """
 
 
-_SCHEMA = """
+# Base schema statements, executed individually inside the startup write
+# transaction (executescript would force its own COMMIT). Each uses
+# IF NOT EXISTS, so a later starter that waited on the lock applies them as
+# no-ops before re-checking the sessions structure.
+_SCHEMA_STATEMENTS = (
+    """
 CREATE TABLE IF NOT EXISTS protocols (
     protocol_id   TEXT NOT NULL,
     version       INTEGER NOT NULL,
@@ -75,8 +81,9 @@ CREATE TABLE IF NOT EXISTS protocols (
     definition_sha256 TEXT NOT NULL,
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (protocol_id, version)
-);
-
+)
+""",
+    """
 CREATE TABLE IF NOT EXISTS decode_cache (
     protocol_id     TEXT NOT NULL,
     version         INTEGER NOT NULL,
@@ -84,8 +91,10 @@ CREATE TABLE IF NOT EXISTS decode_cache (
     result          TEXT NOT NULL,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (protocol_id, version, input_sha256)
-);
-""" + _sessions_table_sql("sessions")
+)
+""",
+    _sessions_table_sql("sessions"),
+)
 
 # Sequence-audit columns were added after the initial release. Existing
 # database files keep their old sessions table (CREATE TABLE IF NOT EXISTS
@@ -103,35 +112,109 @@ _SESSION_AUDIT_COLUMNS = {
     "audit_missing_total": "TEXT NOT NULL DEFAULT '0'",
 }
 
+# How long a concurrent starter waits on the database write lock before
+# SQLite raises "database is locked". The first instance holds that lock for
+# the whole session upgrade; every other instance waits here instead of
+# racing on the schema, then re-checks the structure once it acquires it.
+_MIGRATION_BUSY_TIMEOUT_MS = 30_000
+
+# Switching the journal mode to WAL on a database another process is
+# creating in parallel can return "database is locked" without invoking the
+# busy handler (the file header is still being initialised). Retry briefly;
+# once the database exists in WAL mode the pragma is a read-only no-op.
+_WAL_SETTLE_RETRIES = 30
+_WAL_SETTLE_DELAY_S = 0.2
+
 _init_lock = threading.Lock()
 _initialized: set[str] = set()
 
 
-def _connect(db_path: str) -> sqlite3.Connection:
+def _connect(db_path: str, *, busy_timeout_ms: int = 10_000) -> sqlite3.Connection:
     if db_path != ":memory:":
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    conn = sqlite3.connect(db_path, timeout=busy_timeout_ms / 1000, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # busy_timeout must be in effect before journal_mode=WAL: switching the
+    # journal mode needs the write lock, and a concurrent initialiser would
+    # otherwise fail connection setup with "database is locked".
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    _enable_wal(conn, db_path)
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def _enable_wal(conn: sqlite3.Connection, db_path: str) -> None:
+    if db_path == ":memory:":
+        return
+    for attempt in range(_WAL_SETTLE_RETRIES):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            # Only the cross-process "file still being created" lock is
+            # retried; anything else propagates from connection setup.
+            if "locked" not in str(exc).lower():
+                raise
+            time.sleep(_WAL_SETTLE_DELAY_S)
+    conn.execute("PRAGMA journal_mode=WAL")
 
 
 def init_db(db_path: str) -> None:
     with _init_lock:
         if db_path in _initialized:
             return
-        conn = _connect(db_path)
-        try:
-            conn.executescript(_SCHEMA)
-            _migrate_sessions(conn)
-            conn.commit()
-        finally:
-            conn.close()
+        _initialize_database(db_path)
         _initialized.add(db_path)
 
 
-def _migrate_sessions(conn: sqlite3.Connection) -> None:
+def _initialize_database(db_path: str) -> None:
+    """Create the base schema and upgrade the sessions table on one file.
+
+    Runs without the process lock so it also describes what every OS process
+    does independently when several instances share one SQLite file.
+    """
+    conn = _connect(db_path, busy_timeout_ms=_MIGRATION_BUSY_TIMEOUT_MS)
+    # Autocommit mode with explicit transaction boundaries: the whole
+    # initialisation is one write transaction, so Python's sqlite3 layer
+    # cannot split it into separately locked statements.
+    conn.isolation_level = None
+    try:
+        # BEGIN IMMEDIATE honours busy_timeout: for a brand-new database one
+        # process creates the schema while the other waits and then finds
+        # every table already present; for an old database one process runs
+        # the session upgrade and the other re-checks an already-new schema.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in _SCHEMA_STATEMENTS:
+                conn.execute(statement)
+            _migrate_sessions_locked(conn)
+        except Exception:
+            # Roll back before propagating; ignore a rollback error (e.g. the
+            # connection is already unusable) so the original failure surfaces.
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def _migrate_sessions_locked(conn: sqlite3.Connection) -> None:
+    """Add missing audit columns and rebuild for wide columns, one upgrade.
+
+    The caller already holds the cross-process write lock
+    (``BEGIN IMMEDIATE``) inside the single startup transaction. With that
+    lock held, two service instances starting against the same old database
+    file cannot interleave: one performs the upgrade while the other blocks
+    (up to ``_MIGRATION_BUSY_TIMEOUT_MS``) and, once it acquires the lock,
+    re-reads the structure and finds nothing left to do. The enclosing
+    transaction either commits the complete new table or rolls every
+    statement back — a failed upgrade leaves the original ``sessions`` table
+    and its rows in place, so the next start retries the upgrade from
+    scratch.
+    """
     existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
     for name, ddl in _SESSION_AUDIT_COLUMNS.items():
         if name not in existing:
@@ -149,6 +232,11 @@ def _rebuild_sessions_for_wide_audit(conn: sqlite3.Connection) -> None:
     the table with TEXT-affinity columns converts every stored integer to
     its exact decimal text on copy, so historical sessions read back with
     the same values they had before the migration.
+
+    Every statement here (including DROP/RENAME) runs inside the caller's
+    migration transaction. A failure before the final RENAME is simply
+    rolled back: the original ``sessions`` table keeps its rows and the
+    staging table vanishes, so a retry on the next start can begin cleanly.
     """
     declared = {
         row[1]: (row[2] or "").upper()
@@ -157,6 +245,10 @@ def _rebuild_sessions_for_wide_audit(conn: sqlite3.Connection) -> None:
     if all(declared.get(name) == "TEXT" for name in _WIDE_AUDIT_COLUMNS):
         return
     cols = ", ".join(_SESSION_COLUMNS)
+    # No other upgrade can be in flight on this file (the migration
+    # transaction holds the write lock), but a staging table from an upgrade
+    # of a much older build could survive a crash; drop it inside this
+    # transaction before rebuilding.
     conn.execute("DROP TABLE IF EXISTS sessions_wide_migration")
     conn.execute(_sessions_table_sql("sessions_wide_migration"))
     conn.execute(
