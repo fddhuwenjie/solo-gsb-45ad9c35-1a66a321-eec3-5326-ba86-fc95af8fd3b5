@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -67,7 +68,15 @@ CREATE TABLE IF NOT EXISTS {table} (
 """
 
 
-_SCHEMA = """
+# Staging table used by the in-place rebuild that converts old databases
+# to the wide audit column format. A fixed name is safe because the whole
+# rebuild runs in one write transaction (a second instance blocks on the
+# writer lock until the swap commits); a leftover table from an earlier
+# interrupted attempt is dropped and rebuilt from scratch.
+_MIGRATION_STAGING_TABLE = "sessions_wide_migration"
+
+_SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS protocols (
     protocol_id   TEXT NOT NULL,
     version       INTEGER NOT NULL,
@@ -75,8 +84,9 @@ CREATE TABLE IF NOT EXISTS protocols (
     definition_sha256 TEXT NOT NULL,
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (protocol_id, version)
-);
-
+)
+""",
+    """
 CREATE TABLE IF NOT EXISTS decode_cache (
     protocol_id     TEXT NOT NULL,
     version         INTEGER NOT NULL,
@@ -84,10 +94,11 @@ CREATE TABLE IF NOT EXISTS decode_cache (
     result          TEXT NOT NULL,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (protocol_id, version, input_sha256)
-);
-""" + _sessions_table_sql("sessions")
+)
+""",
+)
 
-# Sequence-audit columns were added after the initial release. Existing
+# Session audit columns were added after the initial release. Existing
 # database files keep their old sessions table (CREATE TABLE IF NOT EXISTS
 # never alters it), so add any missing column in place; sessions created
 # before the upgrade simply have the audit disabled. The two wide columns
@@ -106,33 +117,148 @@ _SESSION_AUDIT_COLUMNS = {
 _init_lock = threading.Lock()
 _initialized: set[str] = set()
 
+# A busy write lock is retried for at most this many attempts. With WAL the
+# competing writer (typically another instance running this same startup
+# migration) holds the lock for milliseconds; the loop and the connection's
+# busy_timeout together only have to outlast pathological scheduling stalls.
+_MIGRATION_BUSY_ATTEMPTS = 60
+_MIGRATION_BUSY_PAUSE = 0.05
 
-def _connect(db_path: str) -> sqlite3.Connection:
+
+def _connect(db_path: str, *, autocommit: bool = False) -> sqlite3.Connection:
     if db_path != ":memory:":
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    # Startup migration drives its own explicit BEGIN IMMEDIATE transaction;
+    # in that mode isolation_level=None keeps Python's sqlite3 from starting
+    # implicit transactions behind our back. Runtime connections keep the
+    # default so ``with conn:`` blocks behave as before.
+    conn = sqlite3.connect(
+        db_path,
+        timeout=30,
+        check_same_thread=False,
+        isolation_level=None if autocommit else "",
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
+def _is_busy_error(exc: sqlite3.Error) -> bool:
+    """Whether ``exc`` is SQLITE_BUSY / SQLITE_LOCKED.
+
+    Both can be reported when two instances migrate the same database file
+    concurrently: the writer lock is busy while the peer holds it, and a
+    short-lived schema-lock state can appear while it swaps the table.
+    """
+    name = type(exc).__name__
+    if name in ("OperationalError", "DatabaseError"):
+        message = str(exc).lower()
+        if "database is locked" in message or "database table is locked" in message:
+            return True
+    return getattr(exc, "sqlite_errorname", "") in ("SQLITE_BUSY", "SQLITE_LOCKED")
+
+
 def init_db(db_path: str) -> None:
     with _init_lock:
         if db_path in _initialized:
             return
-        conn = _connect(db_path)
+        conn = _connect(db_path, autocommit=True)
         try:
-            conn.executescript(_SCHEMA)
-            _migrate_sessions(conn)
-            conn.commit()
+            _initialize_schema(conn)
         finally:
             conn.close()
         _initialized.add(db_path)
 
 
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    """Create the schema and migrate old database files, with retries.
+
+    The whole upgrade (added columns, the wide-column type check and the
+    table rebuild) runs inside one ``BEGIN IMMEDIATE`` write transaction.
+    When several service instances start against the same old SQLite file,
+    only one performs the upgrade; the others block on the write lock,
+    wait for the winner to commit, then re-check the freshly migrated
+    structure and finish startup without touching it. Any failure rolls
+    the transaction back, so the original table and every historical row
+    survive untouched and a later startup retries the upgrade.
+    """
+    last_exc: sqlite3.Error | None = None
+    for _ in range(_MIGRATION_BUSY_ATTEMPTS):
+        try:
+            _initialize_schema_once(conn)
+            return
+        except sqlite3.Error as exc:
+            if not _is_busy_error(exc):
+                raise
+            last_exc = exc
+            time.sleep(_MIGRATION_BUSY_PAUSE)
+    assert last_exc is not None
+    raise last_exc
+
+
+def _initialize_schema_once(conn: sqlite3.Connection) -> None:
+    # Take the cross-process write lock before inspecting anything. CREATE
+    # TABLE IF NOT EXISTS never upgrades an existing table, so the read of
+    # PRAGMA table_info below would otherwise race a peer's in-flight
+    # rebuild: both instances could drop/rename the same tables interleaved
+    # and lose the sessions table mid-startup. If this raises SQLITE_BUSY
+    # no transaction was opened, so the caller can retry immediately.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "sessions" not in existing_tables:
+            # A previous release was interrupted (process kill, power loss)
+            # between DROP TABLE sessions and the rename of the staging
+            # table. The fully populated staging table is the migrated
+            # sessions table: adopt it instead of creating an empty one.
+            if _MIGRATION_STAGING_TABLE in existing_tables:
+                conn.execute(
+                    f"ALTER TABLE {_MIGRATION_STAGING_TABLE} RENAME TO sessions"
+                )
+            else:
+                conn.execute(_sessions_table_sql("sessions"))
+        for statement in _SCHEMA:
+            conn.execute(statement)
+        _migrate_sessions(conn)
+        conn.execute("COMMIT")
+    except BaseException:
+        # Rolls back added columns and the staging-table copy alike; the
+        # original sessions table is never dropped without a committed
+        # replacement, so historical sessions cannot be damaged by an
+        # interrupted or failed migration. The next startup re-runs the
+        # whole upgrade from the intact original table.
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            # Surface the original failure, never a secondary rollback
+            # error; the connection is discarded after init_db fails.
+            pass
+        raise
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> dict[str, str]:
+    return {
+        row[1]: (row[2] or "").upper()
+        for row in conn.execute(f"PRAGMA table_info({table})")
+    }
+
+
 def _migrate_sessions(conn: sqlite3.Connection) -> None:
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    """Bring the sessions table up to the wide audit-column format.
+
+    Must run inside the startup write transaction. Missing audit columns
+    are added in place; when the two wide audit columns are still INTEGER
+    (databases written before the wide format) the whole table is rebuilt
+    with TEXT-affinity columns, converting every stored integer to its
+    exact decimal text on copy.
+    """
+    existing = _table_columns(conn, "sessions")
     for name, ddl in _SESSION_AUDIT_COLUMNS.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
@@ -149,21 +275,34 @@ def _rebuild_sessions_for_wide_audit(conn: sqlite3.Connection) -> None:
     the table with TEXT-affinity columns converts every stored integer to
     its exact decimal text on copy, so historical sessions read back with
     the same values they had before the migration.
+
+    The copy and the DROP/RENAME swap are one unit inside the caller's
+    transaction: a failure anywhere leaves the original table completely
+    untouched, so restarting the service retries the upgrade against the
+    intact historical data. A staging table left behind by an interrupted
+    attempt is simply rebuilt from scratch.
     """
-    declared = {
-        row[1]: (row[2] or "").upper()
-        for row in conn.execute("PRAGMA table_info(sessions)")
-    }
+    declared = _table_columns(conn, "sessions")
     if all(declared.get(name) == "TEXT" for name in _WIDE_AUDIT_COLUMNS):
         return
     cols = ", ".join(_SESSION_COLUMNS)
-    conn.execute("DROP TABLE IF EXISTS sessions_wide_migration")
-    conn.execute(_sessions_table_sql("sessions_wide_migration"))
+    conn.execute(f"DROP TABLE IF EXISTS {_MIGRATION_STAGING_TABLE}")
+    conn.execute(_sessions_table_sql(_MIGRATION_STAGING_TABLE))
     conn.execute(
-        f"INSERT INTO sessions_wide_migration ({cols}) SELECT {cols} FROM sessions"
+        f"INSERT INTO {_MIGRATION_STAGING_TABLE} ({cols}) "
+        f"SELECT {cols} FROM sessions"
     )
+    copied = conn.execute(
+        f"SELECT COUNT(*) FROM {_MIGRATION_STAGING_TABLE}"
+    ).fetchone()[0]
+    original = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    if copied != original:  # pragma: no cover - defensive integrity guard
+        raise sqlite3.DatabaseError(
+            "sessions migration copied "
+            f"{copied} of {original} rows; aborting upgrade"
+        )
     conn.execute("DROP TABLE sessions")
-    conn.execute("ALTER TABLE sessions_wide_migration RENAME TO sessions")
+    conn.execute(f"ALTER TABLE {_MIGRATION_STAGING_TABLE} RENAME TO sessions")
 
 
 def _encode_wide(value: int | None) -> str | None:
